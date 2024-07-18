@@ -122,45 +122,6 @@ class Transformer(nn.Module):
         return x, x_center 
 
 
-class PoolingTransformer(nn.Module):
-    def __init__(self, ori_patch_size, dim, depth, heads, dim_heads, mlp_dim, dropout):
-        super().__init__()
-        self.patch_size = ori_patch_size
-        self.layers = nn.ModuleList([])
-
-        cur_patch_size = self.patch_size
-        for _ in range(depth):
-            padding = 1
-            if self.check_odd((cur_patch_size+1)//2):
-                padding = 1
-                cur_patch_size = (cur_patch_size+1) // 2
-            elif self.check_odd((cur_patch_size-1)//2):
-                padding = 0
-                cur_patch_size = (cur_patch_size-1) // 2
-
-            self.layers.append(nn.ModuleList([
-                nn.MaxPool2d(3, stride=2, padding=padding),
-                Transformer(dim, 1, heads, dim_heads, mlp_dim, dropout)
-            ]))
-            
-    def check_odd(self, a):
-        if a % 2 == 0:
-            return False
-        else:
-            return True
-
-    def forward(self, x, mask=None):
-        x_center = []
-        # x.shape = [batch, dim, patch, patch]
-        for pool, transformer in self.layers:
-            x = pool(x) # [batch, dim, patch//2+1, patch//2+1]
-            b, d, h, w = x.shape
-            x = rearrange(x, 'b s h w -> b (h w) s')
-            x, _ = transformer(x, mask=mask) # [batch, patch**2, dim]
-            x = rearrange(x, 'b (h w) s -> b s h w', h=h, w=w)
-            x_center.append(x[:, :, h//2, w//2])
-        return x, x_center
-    
 
 class SE(nn.Module):
 
@@ -199,30 +160,26 @@ class TransFormerNet(nn.Module):
         mlp_dim = net_params.get("mlp_dim", 8)
         kernal = net_params.get('kernal', 3)
         padding = net_params.get('padding', 1)
-        # stride = net_params.get('stride', 1)
         dropout = net_params.get("dropout", 0)
         dim = net_params.get("dim", 64)
-        self.mask_pct = net_params.get("mask_pct", 50)
         conv2d_out = dim
         dim_heads = dim
         mlp_head_dim = dim
 
+        self.mask_pct = net_params.get("mask_pct", 50)
         self.use_mask = net_params.get('use_mask', False)
-        mask_size_list = [i for i in range(1, patch_size+1, 2)]
-        # mask_size_list = [3,5,7,9,11,13]
+        mask_size_list = [i for i in range(3, patch_size+1, 2)]
         self.mask_list = self.generate_mask(patch_size**2, mask_size_list)
-        print("[check], use_mask=%s, mask_list_size=%s" % (self.use_mask, len(self.mask_list)), mask_size_list)
+        print("[check], use_mask=%s, mask_list_size=%s" % (self.use_mask, len(self.mask_list)))
         
         image_size = patch_size * patch_size
 
         self.pixel_patch_embedding = nn.Linear(conv2d_out, dim)
 
-        self.local_trans_pixel = Transformer(dim=dim, depth=1, heads=heads, dim_heads=dim_heads, mlp_dim=mlp_dim, dropout=dropout)
+        self.local_trans_pixel = Transformer(dim=dim, depth=depth, heads=heads, dim_heads=dim_heads, mlp_dim=mlp_dim, dropout=dropout)
         self.new_image_size = image_size
 
-        self.pool_transformer = PoolingTransformer(patch_size, dim=dim, depth=depth-1, heads=heads, dim_heads=dim_heads, mlp_dim=mlp_dim, dropout=dropout)
-
-        self.pixel_pos_embedding = nn.Parameter(torch.randn(self.new_image_size, dim))
+        self.pixel_pos_embedding = nn.Parameter(torch.randn(self.new_image_size+1, dim))
         self.pixel_pos_embedding_relative = nn.Parameter(torch.randn(self.new_image_size, dim))
         self.pixel_pos_scale = nn.Parameter(torch.ones(1) * 0.01)
         # self.center_weight = nn.Parameter(torch.ones(depth, 1, 1) * 0.01)
@@ -230,7 +187,7 @@ class TransFormerNet(nn.Module):
 
 
         self.conv2d_features = nn.Sequential(
-            nn.Conv2d(in_channels=self.spectral_size, out_channels=conv2d_out, kernel_size=(kernal, kernal), stride=1, padding=(padding,padding)),
+            nn.Conv2d(in_channels=self.spectral_size, out_channels=conv2d_out, kernel_size=(kernal, kernal), padding=(padding,padding)),
             nn.BatchNorm2d(conv2d_out),
             nn.ReLU(),
             # featuremap 
@@ -302,23 +259,6 @@ class TransFormerNet(nn.Module):
             res_mask.append(torch.from_numpy(ll))
         return res_mask
 
-#    def random_mask(self, patch_size):
-#        p_center = (random.randint(0, 100) < self.mask_pct)
-#        if p_center:
-#            # 中心mask
-#            return self.mask_list[random.randint(0,len(self.mask_list)-1)]
-#        else:
-#            # 非中心mask
-#            max_left = patch_size // 2 - 1
-#            real_left = random.randint(0, max_left)
-#            min_right = patch_size // 2 + 1
-#            real_right = random.randint(min_right, patch_size-1)
-#            patch = np.zeros((patch_size, patch_size))
-#            patch[real_left:real_right+1, real_left:real_right+1] = 1
-#            # print(real_left, real_right)
-#            # print(patch)
-#            patch = torch.from_numpy(patch.reshape([1,-1]))
-#            return patch
 
     def random_mask(self, patch_size):
         p_center = (random.randint(0, 100) < self.mask_pct)
@@ -348,20 +288,22 @@ class TransFormerNet(nn.Module):
             # print(patch)
             patch = torch.from_numpy(patch.reshape([1,-1]))
             return patch
-
+        
     def encoder_block(self, x):
         '''
         x: (batch, s, w, h), s=spectral, w=weigth, h=height
         '''
         x_pixel = x 
 
-        x_pixel = self.conv2d_features(x_pixel)
         b, s, w, h = x_pixel.shape
         img = w * h
+        x_pixel = self.conv2d_features(x_pixel)
         # SQSFormer
         # pos_emb = self.get_position_embedding(x_pixel, (h//2, w//2), cls_token=False)
-        pos_emb = self.pixel_pos_embedding[:img,:]
+        pos_emb = self.pixel_pos_embedding
         x_pixel = rearrange(x_pixel, 'b s w h-> b (w h) s') # (batch, w*h, spe)
+        cls_token_pixel = self.cls_token_pixel.expand(x_pixel.shape[0], -1, -1)
+        x_pixel = torch.cat((cls_token_pixel, x_pixel), dim=1)
         x_pixel = x_pixel + torch.unsqueeze(pos_emb, 0)[:,:,:] * self.pixel_pos_scale
         x_pixel = self.dropout(x_pixel)
 
@@ -374,11 +316,11 @@ class TransFormerNet(nn.Module):
                 cur_mask = self.get_serving_mask().to(device)
         else:
             cur_mask = None 
+
         x_pixel, x_center_list = self.local_trans_pixel(x_pixel, mask=cur_mask)
-        x_pixel = rearrange(x_pixel, 'b (h w) s -> b s h w', h=h, w=w)
-        x_pixel, x_center_list = self.pool_transformer(x_pixel, mask=None)
         # shape [batch, seq, dim]
-        logit_x = x_center_list[-1] 
+        # logit_x = x_center_list[-1] 
+        logit_x = self.to_latent_pixel(x_pixel[:,0])
         return self.classifier_mlp(logit_x)
 
     def forward(self, x):

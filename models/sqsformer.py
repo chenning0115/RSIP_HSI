@@ -10,8 +10,7 @@ import torch.nn.init as init
 from einops import rearrange, repeat
 import collections
 import torch.nn as nn
-from utils import device
-import random
+
 
 def _weights_init(m):
     classname = m.__class__.__name__
@@ -79,11 +78,10 @@ class Attention(nn.Module):
 
         # mask value: -inf
         if mask is not None:
-            # mask = F.pad(mask.flatten(1), (1, 0), value = True) #mask shape is [batch, seq]
-            mask = mask.flatten(1) #mask shape is [batch, seq]
+            mask = F.pad(mask.flatten(1), (1, 0), value = True)
             assert mask.shape[-1] == dots.shape[-1], 'mask has incorrect dimensions'
             mask = mask[:, None, :] * mask[:, :, None]
-            dots.masked_fill_(mask==0, mask_value)
+            dots.masked_fill_(~mask, mask_value)
             del mask
 
         # softmax normalization -> attention matrix
@@ -122,45 +120,6 @@ class Transformer(nn.Module):
         return x, x_center 
 
 
-class PoolingTransformer(nn.Module):
-    def __init__(self, ori_patch_size, dim, depth, heads, dim_heads, mlp_dim, dropout):
-        super().__init__()
-        self.patch_size = ori_patch_size
-        self.layers = nn.ModuleList([])
-
-        cur_patch_size = self.patch_size
-        for _ in range(depth):
-            padding = 1
-            if self.check_odd((cur_patch_size+1)//2):
-                padding = 1
-                cur_patch_size = (cur_patch_size+1) // 2
-            elif self.check_odd((cur_patch_size-1)//2):
-                padding = 0
-                cur_patch_size = (cur_patch_size-1) // 2
-
-            self.layers.append(nn.ModuleList([
-                nn.MaxPool2d(3, stride=2, padding=padding),
-                Transformer(dim, 1, heads, dim_heads, mlp_dim, dropout)
-            ]))
-            
-    def check_odd(self, a):
-        if a % 2 == 0:
-            return False
-        else:
-            return True
-
-    def forward(self, x, mask=None):
-        x_center = []
-        # x.shape = [batch, dim, patch, patch]
-        for pool, transformer in self.layers:
-            x = pool(x) # [batch, dim, patch//2+1, patch//2+1]
-            b, d, h, w = x.shape
-            x = rearrange(x, 'b s h w -> b (h w) s')
-            x, _ = transformer(x, mask=mask) # [batch, patch**2, dim]
-            x = rearrange(x, 'b (h w) s -> b s h w', h=h, w=w)
-            x_center.append(x[:, :, h//2, w//2])
-        return x, x_center
-    
 
 class SE(nn.Module):
 
@@ -178,7 +137,6 @@ class SE(nn.Module):
         return F.sigmoid(out)
 
 
-
 class TransFormerNet(nn.Module):
     def __init__(self, params):
         super(TransFormerNet, self).__init__()
@@ -189,9 +147,7 @@ class TransFormerNet(nn.Module):
         self.model_type = net_params.get("model_type", 0)
 
         num_classes = data_params.get("num_classes", 16)
-        self.patch_size = patch_size = data_params.get("patch_size", 13)
-        self.serve_patch_size = data_params.get("serve_patch_size", 13)
-        print("serving_patch_size=%s" % self.serve_patch_size)
+        patch_size = data_params.get("patch_size", 13)
         self.spectral_size = data_params.get("spectral_size", 200)
 
         depth = net_params.get("depth", 1)
@@ -199,28 +155,18 @@ class TransFormerNet(nn.Module):
         mlp_dim = net_params.get("mlp_dim", 8)
         kernal = net_params.get('kernal', 3)
         padding = net_params.get('padding', 1)
-        # stride = net_params.get('stride', 1)
         dropout = net_params.get("dropout", 0)
+        conv2d_out = 64
         dim = net_params.get("dim", 64)
-        self.mask_pct = net_params.get("mask_pct", 50)
-        conv2d_out = dim
         dim_heads = dim
         mlp_head_dim = dim
-
-        self.use_mask = net_params.get('use_mask', False)
-        mask_size_list = [i for i in range(1, patch_size+1, 2)]
-        # mask_size_list = [3,5,7,9,11,13]
-        self.mask_list = self.generate_mask(patch_size**2, mask_size_list)
-        print("[check], use_mask=%s, mask_list_size=%s" % (self.use_mask, len(self.mask_list)), mask_size_list)
         
         image_size = patch_size * patch_size
 
         self.pixel_patch_embedding = nn.Linear(conv2d_out, dim)
 
-        self.local_trans_pixel = Transformer(dim=dim, depth=1, heads=heads, dim_heads=dim_heads, mlp_dim=mlp_dim, dropout=dropout)
+        self.local_trans_pixel = Transformer(dim=dim, depth=depth, heads=heads, dim_heads=dim_heads, mlp_dim=mlp_dim, dropout=dropout)
         self.new_image_size = image_size
-
-        self.pool_transformer = PoolingTransformer(patch_size, dim=dim, depth=depth-1, heads=heads, dim_heads=dim_heads, mlp_dim=mlp_dim, dropout=dropout)
 
         self.pixel_pos_embedding = nn.Parameter(torch.randn(self.new_image_size, dim))
         self.pixel_pos_embedding_relative = nn.Parameter(torch.randn(self.new_image_size, dim))
@@ -230,7 +176,7 @@ class TransFormerNet(nn.Module):
 
 
         self.conv2d_features = nn.Sequential(
-            nn.Conv2d(in_channels=self.spectral_size, out_channels=conv2d_out, kernel_size=(kernal, kernal), stride=1, padding=(padding,padding)),
+            nn.Conv2d(in_channels=self.spectral_size, out_channels=conv2d_out, kernel_size=(kernal, kernal), padding=(padding,padding)),
             nn.BatchNorm2d(conv2d_out),
             nn.ReLU(),
             # featuremap 
@@ -238,6 +184,8 @@ class TransFormerNet(nn.Module):
             # nn.BatchNorm2d(dim),
             # nn.ReLU()
         )
+
+        self.senet = SE(conv2d_out, 5)
 
         self.cls_token_pixel = nn.Parameter(torch.randn(1, 1, dim))
         self.to_latent_pixel = nn.Identity()
@@ -285,69 +233,6 @@ class TransFormerNet(nn.Module):
             pos_index = np.asarray([-1] + list(pos_index))
         pos_emb = self.pixel_pos_embedding_relative[pos_index, :]
         return pos_emb
-        
-
-    def generate_mask(self, seq_num, mask_size_list):
-        # seq int 
-        # return [1, seq_num, seq_num]
-        res_mask = []
-        center_index = seq_num // 2
-        for mask_size in mask_size_list:
-            gap_index =(mask_size ** 2) // 2
-            start_index = center_index - gap_index 
-            end_index = center_index + gap_index
-            ll = np.asarray([0] * seq_num)
-            ll[start_index:end_index+1] = 1
-            ll = ll.reshape([1,-1])
-            res_mask.append(torch.from_numpy(ll))
-        return res_mask
-
-#    def random_mask(self, patch_size):
-#        p_center = (random.randint(0, 100) < self.mask_pct)
-#        if p_center:
-#            # 中心mask
-#            return self.mask_list[random.randint(0,len(self.mask_list)-1)]
-#        else:
-#            # 非中心mask
-#            max_left = patch_size // 2 - 1
-#            real_left = random.randint(0, max_left)
-#            min_right = patch_size // 2 + 1
-#            real_right = random.randint(min_right, patch_size-1)
-#            patch = np.zeros((patch_size, patch_size))
-#            patch[real_left:real_right+1, real_left:real_right+1] = 1
-#            # print(real_left, real_right)
-#            # print(patch)
-#            patch = torch.from_numpy(patch.reshape([1,-1]))
-#            return patch
-
-    def random_mask(self, patch_size):
-        p_center = (random.randint(0, 100) < self.mask_pct)
-        if p_center:
-            # 中心mask
-            return self.mask_list[random.randint(0,len(self.mask_list)-1)]
-        else:
-            # 非中心mask
-            max_left = patch_size // 2 - 1
-            real_left = random.randint(0, max_left)
-            real_up = random.randint(0, max_left)
-            min_right = patch_size // 2 + 1
-            real_right = random.randint(min_right, patch_size-1)
-            real_down = random.randint(min_right, patch_size-1)
-            patch = np.zeros((patch_size, patch_size))
-            patch[real_left:real_right+1, real_up:real_down+1] = 1
-            patch = torch.from_numpy(patch.reshape([1,-1]))
-            return patch
-
-    def get_serving_mask(self):
-            patch = np.zeros((self.patch_size, self.patch_size))
-            center = self.patch_size//2
-            center_l = center - self.serve_patch_size // 2
-            center_r = center + self.serve_patch_size // 2
-            patch[center_l:center_r+1, center_l:center_r+1] = 1
-            # print(real_left, real_right)
-            # print(patch)
-            patch = torch.from_numpy(patch.reshape([1,-1]))
-            return patch
 
     def encoder_block(self, x):
         '''
@@ -355,36 +240,32 @@ class TransFormerNet(nn.Module):
         '''
         x_pixel = x 
 
-        x_pixel = self.conv2d_features(x_pixel)
         b, s, w, h = x_pixel.shape
         img = w * h
+        x_pixel = self.conv2d_features(x_pixel) # [batch, 200, 13, 13]
         # SQSFormer
-        # pos_emb = self.get_position_embedding(x_pixel, (h//2, w//2), cls_token=False)
-        pos_emb = self.pixel_pos_embedding[:img,:]
-        x_pixel = rearrange(x_pixel, 'b s w h-> b (w h) s') # (batch, w*h, spe)
+        pos_emb = self.get_position_embedding(x_pixel, (h//2, w//2), cls_token=False)
+        x_pixel = rearrange(x_pixel, 'b s w h-> b (w h) s') # (batch, w*h, s)
         x_pixel = x_pixel + torch.unsqueeze(pos_emb, 0)[:,:,:] * self.pixel_pos_scale
         x_pixel = self.dropout(x_pixel)
 
-        if self.use_mask:
-            if self.training: # 使用mask策略
-                # cur_mask = self.mask_list[random.randint(0,len(self.mask_list)-1)].to(device)
-                cur_mask = self.random_mask(self.patch_size).to(device)
-            else:
-                # serving
-                cur_mask = self.get_serving_mask().to(device)
-        else:
-            cur_mask = None 
-        x_pixel, x_center_list = self.local_trans_pixel(x_pixel, mask=cur_mask)
-        x_pixel = rearrange(x_pixel, 'b (h w) s -> b s h w', h=h, w=w)
-        x_pixel, x_center_list = self.pool_transformer(x_pixel, mask=None)
-        # shape [batch, seq, dim]
-        logit_x = x_center_list[-1] 
-        return self.classifier_mlp(logit_x)
+        x_pixel, x_center_list = self.local_trans_pixel(x_pixel) #(batch, image_size+1, dim)
+        x_center_tensor = torch.stack(x_center_list, dim=0) # [depth, batch, dim] 
+        # logit_pixel = torch.sum(x_center_tensor * self.center_weight, dim=0)
+        logit_pixel = x_center_list[-1]
+        logit_x = logit_pixel 
+        reduce_x = torch.mean(x_pixel, dim=1)
+        return logit_x, reduce_x
 
-    def forward(self, x):
+    def forward(self, x,left=None,right=None):
         '''
         x: (batch, s, w, h), s=spectral, w=weigth, h=height
 
         '''
-        logit_x = self.encoder_block(x)
-        return  logit_x
+        logit_x, _ = self.encoder_block(x)
+        mean_left, mean_right = None, None
+        if left is not None and right is not None:
+            _, mean_left = self.encoder_block(left)
+            _, mean_right = self.encoder_block(right)
+
+        return  self.classifier_mlp(logit_x)

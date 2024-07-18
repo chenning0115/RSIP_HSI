@@ -7,12 +7,12 @@ from sklearn.metrics import confusion_matrix, accuracy_score, classification_rep
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import WeightedRandomSampler
 from operator import truediv
 import time, json
 import os, sys
 
 """ Training dataset"""
-
 class DataSetIter(torch.utils.data.Dataset):
     def __init__(self, _base_img, _base_labels, _index2pos, _margin, _patch_size, _append_dim, random_rotate=False) -> None:
         self.base_img = _base_img #全量数据包括margin (145+2margin * 145+2margin * spe)
@@ -106,7 +106,7 @@ class HSIDataLoader(object):
 
     def load_raw_data(self):
         data, labels = None, None
-        assert self.data_sign in ['Indian', 'Pavia', 'Houston', 'Salinas', 'WH']
+        assert self.data_sign in ['Indian', 'Pavia', 'Houston', 'Salinas', 'Honghu']
         data_path = '%s/%s/%s_split.mat' % (self.data_path_prefix, self.data_sign, self.data_file)
         all_data = sio.loadmat(data_path)
         data = all_data['input']
@@ -298,6 +298,7 @@ class HSIDataLoader(object):
 
         trainset, unlabelset, testset, allset = self.prepare_data()
 
+
         multi=self.data_param.get('unlabelled_multiple',1)
         train_loader = torch.utils.data.DataLoader(dataset=trainset,
                                                 batch_size=self.batch_size,
@@ -329,5 +330,5 @@ class HSIDataLoader(object):
 
 if __name__ == "__main__":
     dataloader = HSIDataLoader({"data":{"data_path_prefix":'../../data', "data_sign": "Indian",
-        "data_file": "Indian_40", "use_dump":True}})
+        "data_file": "Indian_20", "use_dump":True}})
     train_loader, unlabel_loader, test_loader, all_loader = dataloader.generate_torch_dataset()

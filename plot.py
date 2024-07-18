@@ -2,7 +2,7 @@ import numpy as np
 from operator import truediv
 import matplotlib.pyplot as plt
 colors = [
-    [0, 0, 1],
+    [0, 0, 120],
     [255, 128, 0],
     [127, 255, 0],
     [0, 255, 0],

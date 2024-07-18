@@ -3,7 +3,7 @@ import json, time
 import numpy as np
 import torch
 
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
 config_path_prefix = './params_use'
 
 def check_convention(name):
@@ -74,7 +74,8 @@ class HSIRecoder(object):
         with open(save_path_json, 'w') as fout:
             fout.write(ss)
             fout.flush()
-        np.save(save_path_pred, self.pred)
+        if self.pred:
+            np.save(save_path_pred, self.pred)
 
         print("save record of %s done!" % path)
         

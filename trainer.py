@@ -5,6 +5,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from models import transformer as transformer
+from models import transformer_mask
+from models import transformer_MoE
+from models import sqsformer
 from models import conv1d
 from models import conv2d
 from models import conv3d
@@ -12,6 +15,7 @@ from models import SSFTTnet
 from models import CASST
 from models import SSRN
 import utils
+from models import transformer_base
 from utils import recorder
 from evaluation import HSIEvaluation
 import itertools
@@ -103,6 +107,7 @@ class BaseTrainer(object):
         epochs = self.params['train'].get('epochs', 100)
         total_loss = 0
         epoch_avg_loss = utils.AvgrageMeter()
+        max_oa = 0
         for epoch in range(epochs):
             self.net.train()
             epoch_avg_loss.reset()
@@ -110,6 +115,140 @@ class BaseTrainer(object):
                 data, target = data.to(self.device), target.to(self.device)
                 outputs = self.net(data)
                 loss = self.get_loss(outputs, target)
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.clip)
+                self.optimizer.step()
+                # batch stat
+                total_loss += loss.item()
+                epoch_avg_loss.update(loss.item(), data.shape[0])
+            recorder.append_index_value("epoch_loss", epoch + 1, epoch_avg_loss.get_avg())
+            print('[Epoch: %d]  [epoch_loss: %.5f]  [all_epoch_loss: %.5f] [current_batch_loss: %.5f] [batch_num: %s]' % (epoch + 1,
+                                                                             epoch_avg_loss.get_avg(), 
+                                                                             total_loss / (epoch + 1),
+                                                                             loss.item(), epoch_avg_loss.get_num()))
+            # 一定epoch下进行一次eval
+            if test_loader and (epoch+1) % 60 == 0:
+                y_pred_test, y_test = self.test(test_loader)
+                temp_res = self.evalator.eval(y_test, y_pred_test)
+                max_oa = max(max_oa, temp_res['oa'])
+                recorder.append_index_value("train_oa", epoch+1, temp_res['oa'])
+                recorder.append_index_value("train_aa", epoch+1, temp_res['aa'])
+                recorder.append_index_value("train_kappa", epoch+1, temp_res['kappa'])
+                recorder.append_index_value("max_oa", epoch+1, max_oa)
+                print('[--TEST--] [Epoch: %d] [oa: %.5f] [aa: %.5f] [kappa: %.5f] [num: %s]' % (epoch+1, temp_res['oa'], temp_res['aa'], temp_res['kappa'], str(y_test.shape)))
+        print('Finished Training')
+        return True
+
+    def final_eval(self, test_loader):
+        y_pred_test, y_test = self.test(test_loader)
+        temp_res = self.evalator.eval(y_test, y_pred_test)
+        return temp_res
+
+    def get_logits(self, output):
+        if type(output) == tuple:
+            return output[0]
+        return output
+
+    def test(self, test_loader):
+        """
+        provide test_loader, return test result(only net output)
+        """
+        count = 0
+        self.net.eval()
+        y_pred_test = 0
+        y_test = 0
+        for inputs, labels in test_loader:
+            inputs = inputs.to(self.device)
+            logits = self.get_logits(self.net(inputs))
+            if len(logits.shape) == 1:
+                continue
+            outputs = np.argmax(logits.detach().cpu().numpy(), axis=1)
+            
+            # ------
+            # outputs shape [batch], logits: [batch, class_num]
+            # p = torch.softmax(logits, dim=-1)
+            # for k, temp_label in enumerate(labels):
+            #     if temp_label != outputs[k]:
+            #         pre = outputs[k]
+            #         real = temp_label.detach().cpu().numpy()
+            #         pp = p[k].detach().cpu().numpy()
+            #         print("real=%s, %.3f, pred=%s, %.3f" % (real, pp[real], pre, pp[pre]))
+
+            # ------
+
+            if count == 0:
+                y_pred_test = outputs
+                y_test = labels
+                count = 1
+            else:
+                y_pred_test = np.concatenate((y_pred_test, outputs))
+                y_test = np.concatenate((y_test, labels))
+        return y_pred_test, y_test
+
+class MoETrainer(BaseTrainer):
+    def __init__(self, params) -> None:
+        super(MoETrainer, self).__init__(params)
+        self.task_num = self.net_params.get('task_num', 3)
+        self.task_weight = self.net_params.get('task_weight', [1,0,0])
+        print("task_weight=", self.task_weight)
+        # self.task_label_list = [[1,2,3],[9,10,11]]
+        self.task_label_list = self.net_params.get('task_label_list', [[1,2,3], [9,10,11]])
+        self.criterion = [nn.CrossEntropyLoss() for i in range(self.task_num)]
+
+    def real_init(self):
+        # net
+        self.net = transformer_MoE.TransFormerNet(self.params).to(self.device)
+        # loss
+        # optimizer
+        self.lr = self.train_params.get('lr', 0.001)
+        self.weight_decay = self.train_params.get('weight_decay', 5e-3)
+        self.optimizer = optim.Adam(self.net.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+
+    def get_loss(self, outputs, target):
+        '''
+            A_vecs: [batch, dim]
+            B_vecs: [batch, dim]
+            logits: [batch, class_num]
+        '''
+        loss = 0
+        w = self.task_weight
+        i = 0
+        for i in range(self.task_num): 
+            logit, label = outputs[i], target[i]
+            temp_loss = (w[i] * nn.CrossEntropyLoss(ignore_index=-1)(logit, label))
+            # print(i, temp_loss)
+            loss += temp_loss
+        return loss   
+
+    def update_labels(self, labels):
+        # labels shape : [batch]
+        res = []
+        for task_label in self.task_label_list:
+            temp_label = labels
+            temp_check_label = torch.zeros_like(labels).bool() 
+            for i, cur_label in enumerate(task_label):
+                temp_label = temp_label.masked_fill(labels==cur_label, i)
+                temp_check_label = temp_check_label | (labels==cur_label)
+            temp_label = temp_label.masked_fill(temp_check_label==False, -1)     
+            res.append(temp_label)
+        return res
+
+    def train(self, train_loader, unlabel_loader=None, test_loader=None):
+        epochs = self.params['train'].get('epochs', 100)
+        total_loss = 0
+        epoch_avg_loss = utils.AvgrageMeter()
+        for epoch in range(epochs):
+            self.net.train()
+            epoch_avg_loss.reset()
+            for i, (data, target) in enumerate(train_loader):
+                # print(target.max())
+                label_list = [target] + self.update_labels(target)
+                data = data.to(self.device) # data: [*], target: [batch]
+                labels = [x.to(self.device) for x in label_list]
+                outputs = self.net(data) #shape [[batch, class_num0], [batch, class_num1]]
+
+                loss = self.get_loss(outputs, labels)
                 self.optimizer.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), self.clip)
@@ -139,7 +278,7 @@ class BaseTrainer(object):
         return temp_res
 
     def get_logits(self, output):
-        if type(output) == tuple:
+        if type(output) == tuple or type(output) == list:
             return output[0]
         return output
 
@@ -153,10 +292,23 @@ class BaseTrainer(object):
         y_test = 0
         for inputs, labels in test_loader:
             inputs = inputs.to(self.device)
-            outputs = self.get_logits(self.net(inputs))
-            if len(outputs.shape) == 1:
+            logits = self.get_logits(self.net(inputs))
+            if len(logits.shape) == 1:
                 continue
-            outputs = np.argmax(outputs.detach().cpu().numpy(), axis=1)
+            outputs = np.argmax(logits.detach().cpu().numpy(), axis=1)
+            
+            # ------
+            # outputs shape [batch], logits: [batch, class_num]
+            # p = torch.softmax(logits, dim=-1)
+            # for k, temp_label in enumerate(labels):
+            #     if temp_label != outputs[k]:
+            #         pre = outputs[k]
+            #         real = temp_label.detach().cpu().numpy()
+            #         pp = p[k].detach().cpu().numpy()
+            #         print("real=%s, %.3f, pred=%s, %.3f" % (real, pp[real], pre, pp[pre]))
+
+            # ------
+
             if count == 0:
                 y_pred_test = outputs
                 y_test = labels
@@ -165,6 +317,123 @@ class BaseTrainer(object):
                 y_pred_test = np.concatenate((y_pred_test, outputs))
                 y_test = np.concatenate((y_test, labels))
         return y_pred_test, y_test
+
+class SQSformerTrainer(BaseTrainer):
+    def __init__(self, params):
+        super(SQSformerTrainer, self).__init__(params)
+
+
+    def real_init(self):
+        # net
+        self.net = sqsformer.TransFormerNet(self.params).to(self.device)
+        # loss
+        self.criterion = nn.CrossEntropyLoss()
+        # optimizer
+        self.lr = self.train_params.get('lr', 0.001)
+        self.weight_decay = self.train_params.get('weight_decay', 5e-3)
+        self.optimizer = optim.Adam(self.net.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+
+    def get_loss(self, outputs, target):
+        '''
+            A_vecs: [batch, dim]
+            B_vecs: [batch, dim]
+            logits: [batch, class_num]
+        '''
+        logits = outputs
+        
+        loss_main = nn.CrossEntropyLoss()(logits, target) 
+
+        return loss_main   
+
+class MaskformerTrainer(BaseTrainer):
+    def __init__(self, params):
+        super(MaskformerTrainer, self).__init__(params)
+
+
+    def real_init(self):
+        # net
+        self.net = transformer_mask.TransFormerNet(self.params).to(self.device)
+        # loss
+        self.criterion = nn.CrossEntropyLoss()
+        # optimizer
+        self.lr = self.train_params.get('lr', 0.001)
+        self.weight_decay = self.train_params.get('weight_decay', 5e-3)
+        self.optimizer = optim.Adam(self.net.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+
+    def test(self, test_loader):
+        """
+        provide test_loader, return test result(only net output)
+        """
+        count = 0
+        self.net.eval()
+        y_pred_test = 0
+        y_test = 0
+        for inputs, labels in test_loader:
+            inputs = inputs.to(self.device)
+            outputs = self.get_logits(self.net(inputs)) # shape = [batch, mask_num, class_num]
+            if len(outputs.shape) == 1:
+                continue
+            
+            logits = outputs.detach().cpu().numpy()
+            outputs = np.argmax(logits, axis=-1)
+            # print(temp_outputs)
+            # outputs = []
+            # for row in temp_outputs:
+                # unique_values, counts = np.unique(row, return_counts=True)
+                # most_frequent_number = unique_values[np.argmax(counts)]
+                # outputs.append(most_frequent_number)
+            if count == 0:
+                y_pred_test = outputs
+                y_test = labels
+                count = 1
+            else:
+                y_pred_test = np.concatenate((y_pred_test, outputs))
+                y_test = np.concatenate((y_test, labels))
+        return y_pred_test, y_test
+
+
+    def get_loss(self, outputs, target):
+        '''
+            A_vecs: [batch, dim]
+            B_vecs: [batch, dim]
+            logits: [batch, class_num]
+        '''
+        logits = outputs
+        
+        loss_main = nn.CrossEntropyLoss()(logits, target) 
+
+        return loss_main   
+
+class TransformerBaseLineTrainer(BaseTrainer):
+    def __init__(self, params):
+        super(TransformerBaseLineTrainer, self).__init__(params)
+
+
+    def real_init(self):
+        # net
+        self.net = transformer_base.TransFormerNet(self.params).to(self.device)
+        # self.net = cross_without_all.HSINet(self.params).to(self.device)
+        # self.net = cross_without_center.HSINet(self.params).to(self.device)
+        # self.net = cross_without_rotate.HSINet(self.params).to(self.device)
+        # loss
+        self.criterion = nn.CrossEntropyLoss()
+        # optimizer
+        self.lr = self.train_params.get('lr', 0.001)
+        self.weight_decay = self.train_params.get('weight_decay', 5e-3)
+        self.optimizer = optim.Adam(self.net.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+
+    def get_loss(self, outputs, target):
+        '''
+            A_vecs: [batch, dim]
+            B_vecs: [batch, dim]
+            logits: [batch, class_num]
+        '''
+        logits = outputs
+        
+        loss_main = nn.CrossEntropyLoss()(logits, target) 
+
+        return loss_main   
+
 
 
 
@@ -192,7 +461,7 @@ class TransformerTrainer(BaseTrainer):
             B_vecs: [batch, dim]
             logits: [batch, class_num]
         '''
-        logits, A_vecs, B_vecs = outputs
+        logits = outputs
         
         loss_main = nn.CrossEntropyLoss()(logits, target) 
 
@@ -299,8 +568,16 @@ class CASSTTrainer(BaseTrainer):
 
 def get_trainer(params):
     trainer_type = params['net']['trainer']
+    if trainer_type == "transformer_base":
+        return TransformerBaseLineTrainer(params)
     if trainer_type == "transformer":
         return TransformerTrainer(params)
+    if trainer_type == "MoE":
+        return MoETrainer(params)
+    if trainer_type == "sqsformer":
+        return SQSformerTrainer(params)
+    if trainer_type == "maskformer":
+        return MaskformerTrainer(params)
     if trainer_type == "conv1d":
         return Conv1dTrainer(params)
     if trainer_type == "conv2d":

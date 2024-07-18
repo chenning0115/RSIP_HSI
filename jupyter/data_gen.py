@@ -127,16 +127,34 @@ def gen_per_class_pct(data_sign, data_path_prefix, real_pct):
     print('train=%s, test=%s' % (ntr, nte))
     return target
 
-
-def run():
-    # signs = ['Indian', 'Pavia', 'Houston', 'Salinas']
+def run_temp():
+    signs = ['Indian', 'Pavia', 'Honghu']
     # signs = ['Salinas']
     # signs = ['Indian']
     # signs = ['Honghu']
     # signs = ['WH']
-    signs = ['Pavia']
+    # signs = ['Pavia']
     data_path_prefix = '../../data'
-    train_num_per_class_list = [20]
+    train_num_per_class_list = [5, 20, 30, 40, 50]
+    # train_num_per_class_list = [60,70,80]
+    times = 5
+    for data_sign in signs:
+        for train_num_per_class in train_num_per_class_list:
+            for t in range(times):
+                save_path = '../../data/%s/%s_%s_%s_split.mat' %(data_sign, data_sign, train_num_per_class, t)
+                target = gen(data_sign, train_num_per_class, data_path_prefix)
+                sio.savemat(save_path, target)
+                print('save %s done.' % save_path)
+
+def run():
+    signs = ['Indian', 'Pavia', 'WH']
+    # signs = ['Salinas']
+    # signs = ['Indian']
+    # signs = ['Honghu']
+    # signs = ['WH']
+    # signs = ['Pavia']
+    data_path_prefix = '../../data'
+    train_num_per_class_list = [10]
     # train_num_per_class_list = [60,70,80]
     for data_sign in signs:
         for train_num_per_class in train_num_per_class_list:
@@ -168,8 +186,10 @@ def run_per_class_pct():
             target = gen_per_class_pct(data_sign, data_path_prefix, real_pct=pct)
             sio.savemat(save_path, target)
             print('save %s done.' % save_path)
+
 if __name__ == "__main__":
-    run()
+    run_temp()
+    # run()
     # run_pct()
     # run_per_class_pct()
 
